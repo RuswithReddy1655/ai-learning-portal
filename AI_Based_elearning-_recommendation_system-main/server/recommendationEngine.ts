@@ -1,0 +1,638 @@
+import { db } from "./_core/db";
+
+type CourseRow = {
+  id: number;
+  title: string;
+  category: string;
+  difficulty: "beginner" | "intermediate" | "advanced";
+  tags: string | null;
+  learnerCount: number | null;
+  rating: number | null;
+  platformRating: number | null;
+};
+
+type UserProfileRow = {
+  skills: string | null;
+  interests: string | null;
+  preferredDifficulty: string | null;
+};
+
+type InteractionAggregate = {
+  courseId: number;
+  interactionScore: number;
+};
+
+type RecommendationInsert = {
+  userId: number;
+  courseId: number;
+  score: number;
+  reason: string;
+  algorithm: string;
+  rank: number;
+  expiresAt: number;
+};
+
+export type RecommendationRow = {
+  recommendationId: number;
+  rank: number;
+  score: number;
+  reason: string;
+  algorithm: string;
+  courseId: number;
+  title: string;
+  category: string;
+  difficulty: "beginner" | "intermediate" | "advanced";
+  tags: string | null;
+  instructor: string | null;
+  duration: number | null;
+  platform: string;
+  platformUrl: string | null;
+  platformPrice: string;
+  rating: number;
+  learnerCount: number;
+  completionRate: number;
+  thumbnailUrl: string | null;
+};
+
+const RECOMMENDATION_LIMIT = 12;
+const RECOMMENDATION_TTL_SECONDS = 24 * 60 * 60;
+
+const SCORE_WEIGHTS = {
+  hybrid: {
+    content: 0.35,
+    collaborative: 0.25,
+    popularity: 0.2,
+    rating: 0.1,
+    difficulty: 0.1,
+  },
+  coldStart: {
+    popularity: 0.65,
+    rating: 0.35,
+  },
+} as const;
+
+export type RecommendationRefreshStatus = {
+  shouldRefresh: boolean;
+  refreshReason:
+    | "missing_cache"
+    | "expired_cache"
+    | "source_data_updated"
+    | "up_to_date";
+  latestGeneratedAt: number;
+  latestExpiresAt: number;
+  latestSourceUpdate: number;
+};
+
+const getRecommendationRefreshStatusInternal = (
+  userId: number
+): RecommendationRefreshStatus => {
+  const meta = db
+    .prepare(
+      `SELECT
+          COUNT(*) AS total,
+          COALESCE(MAX(generatedAt), 0) AS latestGeneratedAt,
+          COALESCE(MAX(expiresAt), 0) AS latestExpiresAt
+       FROM recommendations
+       WHERE userId = ?`
+    )
+    .get(userId) as {
+    total: number;
+    latestGeneratedAt: number;
+    latestExpiresAt: number;
+  };
+
+  if (!meta || meta.total === 0) {
+    return {
+      shouldRefresh: true,
+      refreshReason: "missing_cache",
+      latestGeneratedAt: 0,
+      latestExpiresAt: 0,
+      latestSourceUpdate: 0,
+    };
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (meta.latestExpiresAt <= now) {
+    return {
+      shouldRefresh: true,
+      refreshReason: "expired_cache",
+      latestGeneratedAt: meta.latestGeneratedAt,
+      latestExpiresAt: meta.latestExpiresAt,
+      latestSourceUpdate: 0,
+    };
+  }
+
+  const source = db
+    .prepare(
+      `SELECT
+          COALESCE((SELECT MAX(updatedAt) FROM courses), 0) AS latestCourseUpdate,
+          COALESCE((SELECT MAX(updatedAt) FROM userProfiles WHERE userId = ?), 0) AS latestProfileUpdate,
+          COALESCE((SELECT MAX(timestamp) FROM courseInteractions WHERE userId = ?), 0) AS latestInteractionUpdate`
+    )
+    .get(userId, userId) as {
+    latestCourseUpdate: number;
+    latestProfileUpdate: number;
+    latestInteractionUpdate: number;
+  };
+
+  const latestSourceUpdate = Math.max(
+    source?.latestCourseUpdate ?? 0,
+    source?.latestProfileUpdate ?? 0,
+    source?.latestInteractionUpdate ?? 0
+  );
+
+  if (latestSourceUpdate > meta.latestGeneratedAt) {
+    return {
+      shouldRefresh: true,
+      refreshReason: "source_data_updated",
+      latestGeneratedAt: meta.latestGeneratedAt,
+      latestExpiresAt: meta.latestExpiresAt,
+      latestSourceUpdate,
+    };
+  }
+
+  return {
+    shouldRefresh: false,
+    refreshReason: "up_to_date",
+    latestGeneratedAt: meta.latestGeneratedAt,
+    latestExpiresAt: meta.latestExpiresAt,
+    latestSourceUpdate,
+  };
+};
+
+export const getRecommendationRefreshStatus = (
+  userId: number
+): RecommendationRefreshStatus => {
+  return getRecommendationRefreshStatusInternal(userId);
+};
+
+const shouldRefreshRecommendations = (userId: number): boolean => {
+  return getRecommendationRefreshStatusInternal(userId).shouldRefresh;
+};
+
+const parseJsonStringArray = (value: string | null | undefined): string[] => {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string");
+  } catch {
+    return [];
+  }
+};
+
+const normalizedDifficultyScore = (
+  preferred: string | null,
+  current: string
+): number => {
+  if (!preferred) return 0.5;
+  if (preferred === current) return 1;
+
+  const rankMap: Record<string, number> = {
+    beginner: 1,
+    intermediate: 2,
+    advanced: 3,
+  };
+
+  const pref = rankMap[preferred] ?? 2;
+  const cur = rankMap[current] ?? 2;
+  const diff = Math.abs(pref - cur);
+
+  if (diff === 1) return 0.6;
+  return 0.25;
+};
+
+const normalize = (value: number, max: number): number => {
+  if (max <= 0) return 0;
+  return Math.max(0, Math.min(1, value / max));
+};
+
+const getTopSignal = (signals: Array<{ name: string; value: number }>): string => {
+  const sorted = [...signals].sort((a, b) => b.value - a.value);
+  return sorted[0]?.name ?? "profile match";
+};
+
+const buildRecommendationReason = (
+  category: string,
+  hasBehaviorData: boolean,
+  scores: {
+    content: number;
+    collaborative: number;
+    popularity: number;
+    difficulty: number;
+  }
+): string => {
+  if (!hasBehaviorData) {
+    return `Popular course in ${category}`;
+  }
+
+  const topSignal = getTopSignal([
+    { name: "interest alignment", value: scores.content },
+    { name: "similar learner behavior", value: scores.collaborative },
+    { name: "category popularity", value: scores.popularity },
+    { name: "difficulty fit", value: scores.difficulty },
+  ]);
+
+  return `Recommended for ${topSignal} in ${category}`;
+};
+
+// Stable pseudo-random value in [0, 1) for controlled ranking diversity.
+const seededUnitRandom = (userId: number, courseId: number, seed: number): number => {
+  let x = (userId * 73856093) ^ (courseId * 19349663) ^ (seed * 83492791);
+  x = (x ^ (x >>> 13)) >>> 0;
+  x = Math.imul(x, 1274126177) >>> 0;
+  return (x & 0x7fffffff) / 0x80000000;
+};
+
+const getUserIds = (userId?: number): number[] => {
+  if (userId) return [userId];
+  const rows = db.prepare("SELECT id FROM users").all() as Array<{ id: number }>;
+  return rows.map((row) => row.id);
+};
+
+const getUserProfile = (userId: number): UserProfileRow | null => {
+  const row = db
+    .prepare(
+      `SELECT skills, interests, preferredDifficulty
+       FROM userProfiles
+       WHERE userId = ?
+       LIMIT 1`
+    )
+    .get(userId) as UserProfileRow | undefined;
+
+  return row ?? null;
+};
+
+const getInteractionScores = (userId: number): Map<number, number> => {
+  const rows = db
+    .prepare(
+      `SELECT courseId,
+              SUM(CASE interactionType
+                    WHEN 'completed' THEN 4
+                    WHEN 'rated' THEN 3
+                    WHEN 'started' THEN 2
+                    WHEN 'bookmarked' THEN 2
+                    ELSE 1
+                  END) AS interactionScore
+       FROM courseInteractions
+       WHERE userId = ?
+       GROUP BY courseId`
+    )
+    .all(userId) as InteractionAggregate[];
+
+  return new Map(rows.map((row) => [row.courseId, row.interactionScore]));
+};
+
+const getGlobalInteractionScores = (): Map<number, number> => {
+  const rows = db
+    .prepare(
+      `SELECT courseId,
+              SUM(CASE interactionType
+                    WHEN 'completed' THEN 4
+                    WHEN 'rated' THEN 3
+                    WHEN 'started' THEN 2
+                    WHEN 'bookmarked' THEN 2
+                    ELSE 1
+                  END) AS interactionScore
+       FROM courseInteractions
+       GROUP BY courseId`
+    )
+    .all() as InteractionAggregate[];
+
+  return new Map(rows.map((row) => [row.courseId, row.interactionScore]));
+};
+
+const getCourses = (): CourseRow[] => {
+  return db
+    .prepare(
+      `SELECT id, title, category, difficulty, tags, learnerCount, rating, platformRating
+       FROM courses`
+    )
+    .all() as CourseRow[];
+};
+
+type LocalRecommendation = {
+  courseId: number;
+  score: number;
+  reason: string;
+  algorithm: "hybrid";
+};
+
+export const localRecommend = (userId: number): LocalRecommendation[] => {
+  const profile = db
+    .prepare(
+      `SELECT interests, preferredDifficulty, skills
+       FROM userProfiles
+       WHERE userId = ?
+       LIMIT 1`
+    )
+    .get(userId) as
+    | {
+        interests: string | null;
+        preferredDifficulty: string | null;
+        skills: string | null;
+      }
+    | undefined;
+
+  const interactedRows = db
+    .prepare(
+      `SELECT courseId, interactionType
+       FROM courseInteractions
+       WHERE userId = ?`
+    )
+    .all(userId) as Array<{ courseId: number; interactionType: string }>;
+
+  const engagedCourseIds = new Set(
+    interactedRows
+      .filter((row) => row.interactionType === "viewed" || row.interactionType === "rated")
+      .map((row) => row.courseId)
+  );
+  const allInteractedCourseIds = new Set(interactedRows.map((row) => row.courseId));
+
+  const engagedCategories = new Set(
+    (db
+      .prepare(
+        `SELECT DISTINCT c.category AS category
+         FROM courseInteractions ci
+         JOIN courses c ON c.id = ci.courseId
+         WHERE ci.userId = ?
+           AND ci.interactionType IN ('viewed', 'rated')`
+      )
+      .all(userId) as Array<{ category: string }>).map((row) => row.category.toLowerCase())
+  );
+
+  const negativeCategories = new Set(
+    (db
+      .prepare(
+        `SELECT DISTINCT c.category AS category
+         FROM recommendationFeedback rf
+         JOIN recommendations r ON r.id = rf.recommendationId
+         JOIN courses c ON c.id = r.courseId
+         WHERE rf.userId = ?
+           AND rf.feedback = 'negative'`
+      )
+      .all(userId) as Array<{ category: string }>).map((row) => row.category.toLowerCase())
+  );
+
+  const interests = new Set(parseJsonStringArray(profile?.interests ?? null).map((s) => s.toLowerCase()));
+  const skills = new Set(parseJsonStringArray(profile?.skills ?? null).map((s) => s.toLowerCase()));
+  const preferredDifficulty = (profile?.preferredDifficulty ?? "").toLowerCase();
+
+  const courses = getCourses();
+  const scored = courses
+    .filter((course) => !allInteractedCourseIds.has(course.id))
+    .map((course) => {
+      let score = 0;
+      const reasons: string[] = [];
+      const categoryLower = course.category.toLowerCase();
+      const tags = parseJsonStringArray(course.tags).map((tag) => tag.toLowerCase());
+
+      if (interests.has(categoryLower) || Array.from(interests).some((v) => categoryLower.includes(v))) {
+        score += 3;
+        reasons.push("category matches your interests");
+      }
+
+      if (preferredDifficulty && course.difficulty.toLowerCase() === preferredDifficulty) {
+        score += 2;
+        reasons.push("difficulty matches your preference");
+      }
+
+      const skillOverlap = tags.filter((tag) => skills.has(tag)).length;
+      if (skillOverlap > 0) {
+        score += skillOverlap;
+        reasons.push(`${skillOverlap} skill tag match${skillOverlap > 1 ? "es" : ""}`);
+      }
+
+      if ((course.platformRating ?? 0) > 460) {
+        score += 1;
+        reasons.push("high platform rating");
+      }
+
+      if (engagedCourseIds.size > 0 && engagedCategories.has(categoryLower)) {
+        score += 1;
+        reasons.push("similar to your viewed/rated categories");
+      }
+
+      if (negativeCategories.has(categoryLower)) {
+        score -= 3;
+        reasons.push("downranked from negative feedback");
+      }
+
+      return {
+        courseId: course.id,
+        rawScore: score,
+        reason: reasons.length > 0 ? reasons.join(", ") : "general relevance fit",
+        algorithm: "hybrid" as const,
+      };
+    })
+    .sort((a, b) => b.rawScore - a.rawScore)
+    .slice(0, 10)
+    .map((item) => ({
+      courseId: item.courseId,
+      score: Math.max(1, Math.min(100, item.rawScore * 10)),
+      reason: item.reason,
+      algorithm: item.algorithm,
+    }));
+
+  return scored;
+};
+
+const upsertRecommendations = (recommendations: RecommendationInsert[]): void => {
+  if (recommendations.length === 0) return;
+
+  const userId = recommendations[0].userId;
+
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM recommendations WHERE userId = ?").run(userId);
+
+    const insertStmt = db.prepare(
+      `INSERT INTO recommendations (userId, courseId, score, reason, algorithm, rank, generatedAt, expiresAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    for (const rec of recommendations) {
+      insertStmt.run(
+        rec.userId,
+        rec.courseId,
+        rec.score,
+        rec.reason,
+        rec.algorithm,
+        rec.rank,
+        nowSeconds,
+        rec.expiresAt
+      );
+    }
+  });
+
+  tx();
+};
+
+const buildRecommendationsForUser = (userId: number): RecommendationInsert[] => {
+  const profile = getUserProfile(userId);
+  const userInteractions = getInteractionScores(userId);
+  const interactedCourseIds = new Set<number>(userInteractions.keys());
+
+  const globalInteractions = getGlobalInteractionScores();
+  const courses = getCourses();
+
+  if (courses.length === 0) return [];
+
+  const maxLearnerCount = Math.max(...courses.map((course) => course.learnerCount ?? 0), 1);
+  const maxGlobalInteraction = Math.max(
+    ...Array.from(globalInteractions.values()),
+    1
+  );
+
+  const interestSet = new Set([
+    ...parseJsonStringArray(profile?.skills ?? null),
+    ...parseJsonStringArray(profile?.interests ?? null),
+  ].map((value) => value.toLowerCase()));
+
+  const generationSeed = Math.floor(Date.now() / 10);
+
+  const scored = courses
+    .filter((course) => !interactedCourseIds.has(course.id))
+    .map((course) => {
+      const courseTags = parseJsonStringArray(course.tags).map((tag) => tag.toLowerCase());
+      const tagMatches = courseTags.filter((tag) => interestSet.has(tag)).length;
+      const tagScore = courseTags.length > 0 ? tagMatches / courseTags.length : 0;
+      const categoryScore = interestSet.has(course.category.toLowerCase()) ? 1 : 0;
+      const contentScore = Math.min(1, tagScore * 0.7 + categoryScore * 0.3);
+
+      const collaborativeScore = normalize(globalInteractions.get(course.id) ?? 0, maxGlobalInteraction);
+      const popularityScore = normalize(course.learnerCount ?? 0, maxLearnerCount);
+      const ratingScore = normalize(course.rating ?? 0, 500);
+      const difficultyScore = normalizedDifficultyScore(
+        profile?.preferredDifficulty ?? null,
+        course.difficulty
+      );
+
+      const hasBehaviorData = interestSet.size > 0 || userInteractions.size > 0;
+      const algorithm = hasBehaviorData ? "hybrid_v1" : "cold_start_popularity";
+
+      const hybridWeights = SCORE_WEIGHTS.hybrid;
+      const coldStartWeights = SCORE_WEIGHTS.coldStart;
+
+      const finalScore = hasBehaviorData
+        ? hybridWeights.content * contentScore +
+          hybridWeights.collaborative * collaborativeScore +
+          hybridWeights.popularity * popularityScore +
+          hybridWeights.rating * ratingScore +
+          hybridWeights.difficulty * difficultyScore
+        : coldStartWeights.popularity * popularityScore +
+          coldStartWeights.rating * ratingScore;
+
+      // Add small exploration jitter so manual refresh can rotate similarly scored courses.
+      const jitter = (seededUnitRandom(userId, course.id, generationSeed) - 0.5) * 0.1;
+      const diversifiedScore = Math.max(0, Math.min(1, finalScore + jitter));
+
+      const reason = buildRecommendationReason(course.category, hasBehaviorData, {
+        content: contentScore,
+        collaborative: collaborativeScore,
+        popularity: popularityScore,
+        difficulty: difficultyScore,
+      });
+
+      return {
+        courseId: course.id,
+        score: Math.round(diversifiedScore * 100),
+        reason,
+        algorithm,
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, RECOMMENDATION_LIMIT);
+
+  const expiresAt = Math.floor(Date.now() / 1000) + RECOMMENDATION_TTL_SECONDS;
+
+  return scored.map((item, index) => ({
+    userId,
+    courseId: item.courseId,
+    score: item.score,
+    reason: item.reason,
+    algorithm: item.algorithm,
+    rank: index + 1,
+    expiresAt,
+  }));
+};
+
+export async function generateRecommendations(userId?: number): Promise<void> {
+  const targetUserIds = getUserIds(userId);
+
+  for (const id of targetUserIds) {
+    const recommendations = buildRecommendationsForUser(id);
+    upsertRecommendations(recommendations);
+  }
+}
+
+export async function getRecommendationsForUser(
+  userId: number
+): Promise<RecommendationRow[]> {
+  db.prepare("DELETE FROM recommendations WHERE expiresAt < unixepoch()").run();
+
+  const cachedRows = db
+    .prepare(
+      `SELECT * FROM recommendations
+       WHERE userId = ? AND expiresAt > unixepoch()
+       ORDER BY rank ASC
+       LIMIT 10`
+    )
+    .all(userId) as Array<{ id: number }>;
+
+  if (cachedRows.length === 0) {
+    const generated = localRecommend(userId);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    db.prepare("DELETE FROM recommendations WHERE userId = ?").run(userId);
+
+    const insert = db.prepare(
+      `INSERT INTO recommendations (userId, courseId, score, reason, algorithm, rank, generatedAt, expiresAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch() + 3600)`
+    );
+
+    generated.forEach((item, index) => {
+      insert.run(
+        userId,
+        item.courseId,
+        item.score,
+        item.reason,
+        item.algorithm,
+        index + 1,
+        nowSeconds
+      );
+    });
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT
+          r.id AS recommendationId,
+          r.rank AS rank,
+          r.score AS score,
+          r.reason AS reason,
+          r.algorithm AS algorithm,
+          c.id AS courseId,
+          c.title AS title,
+          c.category AS category,
+          c.difficulty AS difficulty,
+          c.tags AS tags,
+          c.instructor AS instructor,
+          c.duration AS duration,
+          c.platform AS platform,
+          c.platformUrl AS platformUrl,
+          c.platformPrice AS platformPrice,
+          c.rating AS rating,
+          c.learnerCount AS learnerCount,
+          c.completionRate AS completionRate,
+          c.thumbnailUrl AS thumbnailUrl
+       FROM recommendations r
+       JOIN courses c ON c.id = r.courseId
+       WHERE r.userId = ?
+       ORDER BY r.rank ASC`
+    )
+    .all(userId) as RecommendationRow[];
+
+  return rows;
+}
